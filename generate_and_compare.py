@@ -52,9 +52,9 @@ mpl.rcParams.update({
 })
 
 # ---- Config ----
-DATA_DIR = "/home/paperspace/animal_samples_matt"
+DATA_DIR = "/home/paperspace/animals_dataset_full/train"
 OUTPUT_DIR = "/home/paperspace/gen_comparison"
-N_SAMPLE = 10
+N_SAMPLE = 500
 SEED = 42
 
 random.seed(SEED)
@@ -65,53 +65,70 @@ os.makedirs(os.path.join(OUTPUT_DIR, "real"), exist_ok=True)
 os.makedirs(os.path.join(OUTPUT_DIR, "generated"), exist_ok=True)
 
 # ---- Collect all image paths ----
-all_images = sorted(glob.glob(os.path.join(DATA_DIR, "**", "*.jpg"), recursive=True))
-all_images += sorted(glob.glob(os.path.join(DATA_DIR, "**", "*.png"), recursive=True))
-all_images += sorted(glob.glob(os.path.join(DATA_DIR, "**", "*.jpeg"), recursive=True))
+all_images = sorted(glob.glob(os.path.join(DATA_DIR, "*.jpg")))
+all_images += sorted(glob.glob(os.path.join(DATA_DIR, "*.png")))
+all_images += sorted(glob.glob(os.path.join(DATA_DIR, "*.jpeg")))
 print(f"Found {len(all_images)} images total")
 
-# ---- Sample 10 ----
-sampled = random.sample(all_images, N_SAMPLE)
-for p in sampled:
-    animal = os.path.basename(os.path.dirname(p))
-    print(f"  Selected: {animal}/{os.path.basename(p)}")
 
-# ---- Generate similar images via fal.ai ----
+def extract_animal(filepath):
+    """Extract animal name from filename like train_00001_label12_cockroach.jpg"""
+    base = os.path.splitext(os.path.basename(filepath))[0]
+    # Animal name is everything after the last '_labelNN_'
+    parts = base.split("_")
+    # Find the label part and take everything after it
+    for j, part in enumerate(parts):
+        if part.startswith("label"):
+            return "_".join(parts[j + 1:])
+    return "animal"
+
+
+# ---- Sample N ----
+sampled = random.sample(all_images, N_SAMPLE)
+print(f"Sampled {N_SAMPLE} images")
+for p in sampled[:10]:
+    print(f"  e.g. {extract_animal(p)}: {os.path.basename(p)}")
+print(f"  ... and {N_SAMPLE - 10} more")
+
+# ---- Generate fully synthetic images via fal.ai text-to-image ----
 real_arrays = []
 gen_arrays = []
 
+import time
+t_start = time.time()
+
 for i, img_path in enumerate(sampled):
-    animal = os.path.basename(os.path.dirname(img_path))
+    animal = extract_animal(img_path)
     fname = os.path.basename(img_path)
-    print(f"[{i+1}/{N_SAMPLE}] Uploading and generating for {animal}/{fname}...")
+    if i % 50 == 0 or i < 5:
+        elapsed = time.time() - t_start
+        rate = i / elapsed if elapsed > 0 and i > 0 else 0
+        eta = (N_SAMPLE - i) / rate / 60 if rate > 0 else 0
+        print(f"[{i+1}/{N_SAMPLE}] Generating for {animal}/{fname}... "
+              f"({elapsed/60:.1f}min elapsed, ~{eta:.0f}min remaining)")
 
     # Load real image and scale preserving aspect ratio (longest side = 512)
     real_img = Image.open(img_path).convert("RGB")
     w, h = real_img.size
     max_side = 512
     scale = max_side / max(w, h)
-    new_w = round(w * scale / 8) * 8  # round to multiple of 8 for diffusion models
+    new_w = round(w * scale / 8) * 8
     new_h = round(h * scale / 8) * 8
     real_img_resized = real_img.resize((new_w, new_h))
-    print(f"  Original: {w}x{h} -> Resized: {new_w}x{new_h}")
+    print(f"  Real image: {w}x{h} -> {new_w}x{new_h}")
 
-    # Upload image to fal
-    image_url = fal_client.upload_file(img_path)
-    print(f"  Uploaded: {image_url}")
-
-    # Build prompt from the animal category
+    # Build prompt — purely text-driven, no image input
     prompt = (
-        f"a realistic high-resolution photograph of a {animal} in its natural habitat, "
-        f"wildlife photography, detailed, sharp focus, natural lighting"
+        f"A real photograph of a {animal} in its true natural habitat as it would be "
+        f"found in the real world. Wildlife photography, realistic, unedited, natural "
+        f"lighting, sharp focus, taken with a DSLR camera"
     )
 
-    # Generate with FLUX img2img (strength ~0.55 to stay close to original)
+    # Generate from noise via FLUX text-to-image (no image input)
     result = fal_client.subscribe(
-        "fal-ai/flux/dev/image-to-image",
+        "fal-ai/flux/dev",
         arguments={
-            "image_url": image_url,
             "prompt": prompt,
-            "strength": 0.55,
             "num_inference_steps": 28,
             "image_size": {"width": new_w, "height": new_h},
         },
@@ -124,8 +141,8 @@ for i, img_path in enumerate(sampled):
     gen_img_resized = gen_img.resize((new_w, new_h))
 
     # Save copies
-    real_img_resized.save(os.path.join(OUTPUT_DIR, "real", f"{i:02d}_{animal}_{fname}"))
-    gen_img_resized.save(os.path.join(OUTPUT_DIR, "generated", f"{i:02d}_{animal}_{fname}"))
+    real_img_resized.save(os.path.join(OUTPUT_DIR, "real", f"{i:03d}_{animal}_{fname}"))
+    gen_img_resized.save(os.path.join(OUTPUT_DIR, "generated", f"{i:03d}_{animal}_{fname}"))
 
     real_arrays.append(np.array(real_img_resized))
     gen_arrays.append(np.array(gen_img_resized))
@@ -163,12 +180,13 @@ plt.tight_layout()
 fig.savefig(os.path.join(OUTPUT_DIR, "rgb_histogram_comparison.png"))
 print(f"Histogram saved to {OUTPUT_DIR}/rgb_histogram_comparison.png")
 
-# ---- Side-by-side grid of real vs generated (paired vertically) ----
-fig2, axes2 = plt.subplots(2, N_SAMPLE, figsize=(N_SAMPLE * 1.2, 2.8))
-for i in range(N_SAMPLE):
+# ---- Side-by-side grid (show first 10 pairs) ----
+N_GRID = min(10, N_SAMPLE)
+fig2, axes2 = plt.subplots(2, N_GRID, figsize=(N_GRID * 1.2, 2.8))
+for i in range(N_GRID):
     axes2[0, i].imshow(real_arrays[i])
     axes2[0, i].axis("off")
-    animal = os.path.basename(os.path.dirname(sampled[i]))
+    animal = extract_animal(sampled[i])
     axes2[0, i].set_title(animal, fontsize=5)
 
     axes2[1, i].imshow(gen_arrays[i])
